@@ -17,6 +17,8 @@ const dec = n => String(n ?? '').replace('.', ',');
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const dt = ts => new Date(ts).toLocaleString('hr-HR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 const dOnly = ts => new Date(ts).toLocaleDateString('hr-HR');
+const dayKey = ts => { const d = new Date(ts); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+const dayLabel = k => { const [y, m, d] = k.split('-'); return new Date(+y, +m - 1, +d).toLocaleDateString('hr-HR', { weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric' }); };
 const cleanUser = u => String(u || '').trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/đ/g, 'd').replace(/[^a-z0-9._-]/g, '');
 const CATS = { kesteni: 'Kesteni', kokice: 'Kokice', kukuruz: 'Kukuruz', igracke: 'Igračke', ostalo: 'Ostalo' };
 const UNIT_SALE = { kesteni: 'ambalaža', kokice: 'ambalaža', kukuruz: 'klip', igracke: 'kom', ostalo: 'kom' };
@@ -43,7 +45,7 @@ const isAdmin = () => ME && ME.role === 'admin';
 
 /* ---------- stanje ---------- */
 let ME = null;
-const S = { config: { stock: [], products: [] }, purchases: [], handovers: [], last: null, users: [] };
+const S = { config: { stock: [], products: [] }, purchases: [], handovers: [], closes: [], last: null, users: [] };
 let tab = 'smjena';
 let draft = null;
 let period = 'danas';
@@ -121,6 +123,7 @@ async function loadData() {
   if (isAdmin()) {
     jobs.push(sb.from('purchases').select('*').order('ts', { ascending: false }).limit(5000).then(({ data, error }) => { if (error) throw error; S.purchases = (data || []).map(p => ({ id: p.id, ts: +p.ts, stockId: p.stock_id, qty: +p.qty, unitCost: +p.unit_cost, note: p.note })); }));
     jobs.push(sb.from('handovers').select('data').order('ts', { ascending: false }).limit(3000).then(({ data, error }) => { if (error) throw error; S.handovers = (data || []).map(h => h.data); }));
+    jobs.push(sb.from('day_closes').select('data').order('id', { ascending: false }).limit(1000).then(({ data, error }) => { if (error) throw error; S.closes = (data || []).map(c => c.data); }));
   }
   await Promise.all(jobs);
 }
@@ -133,7 +136,7 @@ async function startApp() {
 }
 async function refresh() { try { await loadData(); toast('Osvježeno'); } catch (e) { toast(errText(e)); } render(true); }
 
-const TABS_ADMIN = [['smjena', 'Primopredaja'], ['igracke', 'Igračke'], ['nabava', 'Nabava'], ['zaliha', 'Zaliha'], ['artikli', 'Artikli i cijene'], ['izvjestaj', 'Izvještaj'], ['radnici', 'Radnici']];
+const TABS_ADMIN = [['smjena', 'Primopredaja'], ['igracke', 'Igračke'], ['nabava', 'Nabava'], ['zaliha', 'Zaliha'], ['artikli', 'Artikli i cijene'], ['zakljucak', 'Zaključak dana'], ['izvjestaj', 'Izvještaj'], ['radnici', 'Radnici']];
 function shell() {
   const tabs = isAdmin() ? TABS_ADMIN : [['smjena', 'Primopredaja']];
   $('#app').innerHTML = `<header><div class="top"><h1>🌰 Štand</h1><div class="who"><span>${esc(ME.display_name)}${isAdmin() ? ' · admin' : ''}</span><button onclick="refresh()">↻</button><button onclick="logout()">Odjava</button></div></div>
@@ -145,12 +148,37 @@ function go(t) { tab = t; ls.set('stand_tab', t); render(true); try { window.scr
 /* ---------- izračuni ---------- */
 const prodById = id => S.config.products.find(p => p.id === id);
 const stockById = id => S.config.stock.find(s => s.id === id);
+const closedSet = () => new Set(S.closes.map(c => c.date));
+const isToyStock = id => { const st = stockById(id); return !!(st && st.toy); };
+/* Igračke: prodaja se skida sa zalihe i s nabava (FIFO) tek kad se dan zaključi.
+   Ostala roba: odmah po primopredaji (procjena po gramaži). */
 function stockStats() {
-  const st = {}; S.config.stock.forEach(s => st[s.id] = { bought: 0, cost: 0, writeoff: 0, used: 0 });
+  const st = {}; S.config.stock.forEach(s => st[s.id] = { bought: 0, cost: 0, writeoff: 0, used: 0, pending: 0 });
+  const closed = closedSet();
   S.purchases.forEach(p => { const x = st[p.stockId]; if (!x) return; if (p.qty >= 0) { x.bought += p.qty; x.cost += p.qty * p.unitCost; } else x.writeoff += -p.qty; });
-  S.handovers.forEach(h => (h.lines || []).forEach(l => { const x = st[l.stockId]; if (x) x.used += l.sold * (l.use || 0); }));
+  S.handovers.forEach(h => (h.lines || []).forEach(l => {
+    const x = st[l.stockId]; if (!x) return;
+    if (isToyStock(l.stockId)) { if (!closed.has(dayKey(h.ts))) x.pending += l.sold; }
+    else x.used += l.sold * (l.use || 0);
+  }));
+  S.closes.forEach(c => Object.entries(c.toys || {}).forEach(([sid, q]) => { if (st[sid]) st[sid].used += q; }));
   Object.values(st).forEach(x => { x.avg = x.bought > 0 ? x.cost / x.bought : 0; x.left = x.bought - x.writeoff - x.used; });
   return st;
+}
+/* FIFO: koliko je ostalo od svake nabave igračaka (otpisi i zaključeni dani troše najstariju nabavu) */
+function toyBatches() {
+  const rem = {}, missing = {};
+  const bySt = {};
+  S.purchases.filter(p => isToyStock(p.stockId)).forEach(p => (bySt[p.stockId] = bySt[p.stockId] || { batches: [], events: [] }) &&
+    (p.qty > 0 ? bySt[p.stockId].batches.push({ id: p.id, ts: p.ts, left: p.qty }) : bySt[p.stockId].events.push({ ts: p.ts, q: -p.qty })));
+  S.closes.forEach(c => Object.entries(c.toys || {}).forEach(([sid, q]) => { if (!isToyStock(sid)) return; (bySt[sid] = bySt[sid] || { batches: [], events: [] }).events.push({ ts: c.dayTs || 0, q }); }));
+  Object.entries(bySt).forEach(([sid, o]) => {
+    o.batches.sort((a, b) => a.ts - b.ts); o.events.sort((a, b) => a.ts - b.ts);
+    let short = 0;
+    o.events.forEach(e => { let q = e.q; for (const b of o.batches) { if (q <= 0) break; const t = Math.min(b.left, q); b.left -= t; q -= t; } short += q; });
+    o.batches.forEach(b => rem[b.id] = b.left); missing[sid] = short;
+  });
+  return { rem, missing };
 }
 const activeProducts = () => {
   const order = Object.keys(CATS);
@@ -321,9 +349,10 @@ function renderIgracke() {
   h += `<div class="card"><h2>Igračke (${toys.length})</h2>`;
   if (!toys.length) h += `<div class="empty">Još nema igračaka.</div>`;
   toys.sort((a, b) => a.name.localeCompare(b.name, 'hr')).forEach(p => {
-    const x = st[p.stockId] || { left: 0, avg: 0 }; const mar = p.price - x.avg;
+    const x = st[p.stockId] || { left: 0, avg: 0, pending: 0 }; const mar = p.price - x.avg;
     h += `<div class="prod" ${p.active === false ? 'style="opacity:.55"' : ''}>
      <div class="head"><b>${esc(p.name)}</b><span class="${x.left <= 0 ? 'bad' : x.left < 5 ? 'warn' : 'muted'}">na zalihi: <b>${qty(x.left)}</b> kom</span></div>
+     ${x.pending ? `<div class="warn" style="font-size:13px;margin-bottom:4px">prodano ${qty(x.pending)} kom – skida se sa zalihe kad se zaključi dan</div>` : ''}
      <div class="row"><label>Naziv<input data-p="${p.id}" data-k="name" value="${esc(p.name)}"></label>
       <label>Prodajna €<input class="num" inputmode="decimal" data-p="${p.id}" data-k="price" value="${dec(p.price)}"></label></div>
      <div class="row" style="margin-top:6px"><label>Dopuna – komada<input class="num" inputmode="decimal" id="dq_${p.id}"></label>
@@ -374,9 +403,11 @@ function renderNabava() {
   if (!S.purchases.length) h += `<div class="empty">Nema upisanih nabava.</div>`;
   else {
     h += `<table><tr><th>Datum</th><th>Roba</th><th class="r">Kol.</th><th class="r">Cijena</th><th class="r">Ukupno</th><th></th></tr>`;
+    const fifo = toyBatches();
     S.purchases.slice(0, 80).forEach(p => {
       const s = stockById(p.stockId);
-      h += `<tr><td>${dOnly(p.ts)}</td><td>${esc(s ? s.name : '?')}${p.note ? `<div class="muted">${esc(p.note)}</div>` : ''}</td><td class="r ${p.qty < 0 ? 'bad' : ''}">${qty(p.qty)} ${s ? s.unit : ''}</td><td class="r">${p.qty < 0 ? 'otpis' : eur(p.unitCost)}</td><td class="r">${p.qty < 0 ? '–' : eur(p.qty * p.unitCost)}</td><td class="r"><button class="btn bad small" onclick="delPurchase('${p.id}')">✕</button></td></tr>`;
+      const remTxt = s && s.toy && p.qty > 0 ? `<div class="${fifo.rem[p.id] > 0 ? 'muted' : 'bad'}" style="font-size:12px">ostalo ${qty(fifo.rem[p.id] ?? p.qty)} kom</div>` : '';
+      h += `<tr><td>${dOnly(p.ts)}</td><td>${esc(s ? s.name : '?')}${p.note ? `<div class="muted">${esc(p.note)}</div>` : ''}</td><td class="r ${p.qty < 0 ? 'bad' : ''}">${qty(p.qty)} ${s ? s.unit : ''}${remTxt}</td><td class="r">${p.qty < 0 ? 'otpis' : eur(p.unitCost)}</td><td class="r">${p.qty < 0 ? '–' : eur(p.qty * p.unitCost)}</td><td class="r"><button class="btn bad small" onclick="delPurchase('${p.id}')">✕</button></td></tr>`;
     });
     h += `</table>`;
   }
@@ -408,14 +439,16 @@ async function delPurchase(id) {
 /* ================= ZALIHA (admin) ================= */
 function renderZaliha() {
   const st = stockStats();
-  let h = `<div class="card"><h2>Stanje robe</h2><p class="muted">Kupljeno − otpis − prodano (iz primopredaja × utrošak po ambalaži). Za kestene i kokice je procjena prema upisanoj gramaži.</p>`;
+  let h = `<div class="card"><h2>Stanje robe</h2><p class="muted">Kupljeno − otpis − prodano. Kesteni, kokice i kukuruz: odmah po primopredaji (procjena po gramaži). <b>Igračke: tek kad se zaključi dan.</b></p>`;
   if (!S.config.stock.length) return h + `<div class="empty">Nema robe.</div></div>`;
   h += `<table><tr><th>Roba</th><th class="r">Kupljeno</th><th class="r">Potrošeno</th><th class="r">Ostalo</th><th class="r">Vrijednost</th></tr>`;
   let tot = 0;
   const list = [...S.config.stock].sort((a, b) => (a.toy ? 1 : 0) - (b.toy ? 1 : 0));
+  const fifo = toyBatches();
   list.forEach(s => {
-    const x = st[s.id]; const val = Math.max(0, x.left) * x.avg; tot += val;
-    h += `<tr><td>${esc(s.name)}<div class="muted">${eur(x.avg)}/${s.unit}</div></td><td class="r">${qty(x.bought)} ${s.unit}</td><td class="r">${qty(x.used + x.writeoff)} ${s.unit}${x.writeoff ? `<div class="muted">otpis ${qty(x.writeoff)}</div>` : ''}</td><td class="r"><b class="${x.left < 0 ? 'bad' : ''}">${qty(x.left)} ${s.unit}</b></td><td class="r">${eur(val)}</td></tr>`;
+    const x = st[s.id];
+    const val = s.toy ? S.purchases.filter(p => p.stockId === s.id && p.qty > 0).reduce((a, p) => a + Math.max(0, fifo.rem[p.id] ?? p.qty) * p.unitCost, 0) : Math.max(0, x.left) * x.avg; tot += val;
+    h += `<tr><td>${esc(s.name)}<div class="muted">${eur(x.avg)}/${s.unit}</div></td><td class="r">${qty(x.bought)} ${s.unit}</td><td class="r">${qty(x.used + x.writeoff)} ${s.unit}${x.writeoff ? `<div class="muted">otpis ${qty(x.writeoff)}</div>` : ''}</td><td class="r"><b class="${x.left < 0 ? 'bad' : ''}">${qty(x.left)} ${s.unit}</b>${x.pending ? `<div class="warn" style="font-size:12px">−${qty(x.pending)} nakon zaključka</div>` : ''}</td><td class="r">${eur(val)}</td></tr>`;
   });
   h += `<tr><td colspan="4"><b>Ukupna vrijednost zalihe</b></td><td class="r"><b>${eur(tot)}</b></td></tr></table>`;
   if (Object.values(st).some(x => x.left < 0)) h += `<p class="bad" style="font-size:14px">Negativno stanje: nabava nije upisana ili je stvarna gramaža ambalaže drugačija od upisane.</p>`;
@@ -532,7 +565,7 @@ function renderIzvjestaj() {
     ${x.counted !== null && x.counted !== undefined ? `<span>Izbrojano u kasi</span><span class="r">${eur(x.counted)}</span>` : ''}
     <span>Ostavljeno za iduću smjenu</span><span class="r">${eur(x.floatLeft)}</span><span class="tot">Za predaju</span><span class="r tot">${eur(x.handover)}</span></div>
     <p class="muted">Upisao/la: ${esc(x.by || '')}${x.note ? ' · Napomena: ' + esc(x.note) : ''}</p>
-    ${S.handovers[0] && x.id === S.handovers[0].id ? `<button class="btn bad small" onclick="delHandover('${x.id}')">Poništi ovu (zadnju) primopredaju</button>` : ''}</details>`;
+    ${S.handovers[0] && x.id === S.handovers[0].id && !closedSet().has(dayKey(x.ts)) ? `<button class="btn bad small" onclick="delHandover('${x.id}')">Poništi ovu (zadnju) primopredaju</button>` : ''}</details>`;
   });
   return h + `</div>`;
 }
@@ -541,6 +574,63 @@ async function delHandover(id) {
   const { error } = await sb.from('handovers').delete().eq('id', id);
   if (error) return toast(errText(error));
   draft = null; saveDraftNull(); await refresh();
+}
+
+/* ================= ZAKLJUČAK DANA (admin) ================= */
+function daysSummary() {
+  const days = {};
+  S.handovers.forEach(h => {
+    const k = dayKey(h.ts); const d = days[k] = days[k] || { date: k, hs: [], revenue: 0, handed: 0, diff: 0, expenses: 0, toys: {}, toyNames: {} };
+    d.hs.push(h); d.revenue += h.revenue; d.handed += h.handover; d.diff += h.diff || 0; d.expenses += h.expenses || 0;
+    (h.lines || []).forEach(l => { if (isToyStock(l.stockId) && l.sold) { d.toys[l.stockId] = (d.toys[l.stockId] || 0) + l.sold; d.toyNames[l.stockId] = l.name; } });
+  });
+  return Object.values(days).sort((a, b) => b.date.localeCompare(a.date));
+}
+function renderZakljucak() {
+  const days = daysSummary(); const closes = Object.fromEntries(S.closes.map(c => [c.date, c])); const st = stockStats();
+  const open = days.filter(d => !closes[d.date]);
+  let h = `<div class="card"><h2>Zaključak dana</h2><p class="muted">Zaključivanjem dana prodane igračke skidaju se sa zalihe i s nabava (prvo s najstarije). Primopredaje zaključenog dana više se ne mogu poništiti.</p>
+    ${open.length ? `<p class="warn" style="margin:0">Nezaključenih dana: <b>${open.length}</b></p>` : '<p class="ok" style="margin:0">Svi dani su zaključeni ✓</p>'}</div>`;
+  if (!days.length) return h + `<div class="card"><div class="empty">Još nema primopredaja.</div></div>`;
+  days.slice(0, 60).forEach(d => {
+    const c = closes[d.date];
+    const toys = Object.entries(c ? c.toys || {} : d.toys);
+    h += `<div class="card"><div class="head" style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><h2 style="margin:0">${dayLabel(d.date)}</h2>
+      ${c ? `<span class="pill ok">zaključeno ✓</span>` : `<span class="pill warn">otvoreno</span>`}</div>
+      <div class="sum" style="margin-top:8px"><span>Primopredaja</span><span class="r">${d.hs.length}</span>
+      <span>Promet</span><span class="r"><b>${eur(d.revenue)}</b></span><span>Predano</span><span class="r">${eur(d.handed)}</span>
+      <span>Isplaćeno iz kase</span><span class="r">${eur(d.expenses)}</span>
+      <span>Manjak / višak</span><span class="r ${d.diff < 0 ? 'bad' : d.diff > 0 ? 'warn' : ''}">${eur(d.diff)}</span></div>`;
+    h += `<h3>Igračke ${c ? 'skinute' : 'za skidanje'} sa zalihe</h3>`;
+    if (!toys.length) h += `<div class="muted">Taj dan nije prodana nijedna igračka.</div>`;
+    else {
+      h += `<table><tr><th>Igračka</th><th class="r">Prodano</th>${c ? '' : '<th class="r">Zaliha nakon</th>'}</tr>`;
+      toys.forEach(([sid, q]) => { const name = (c ? (c.toyNames || {})[sid] : d.toyNames[sid]) || (stockById(sid) || {}).name || '?'; const after = (st[sid] ? st[sid].left : 0) - q;
+        h += `<tr><td>${esc(name)}</td><td class="r">${qty(q)} kom</td>${c ? '' : `<td class="r ${after < 0 ? 'bad' : ''}">${qty(after)} kom</td>`}</tr>`; });
+      h += `</table>`;
+    }
+    h += c ? `<p class="muted" style="margin:8px 0">Zaključio/la ${esc(c.by || '')}, ${dt(c.ts)}</p><button class="btn sec small" onclick="reopenDay('${d.date}')">Otvori dan ponovno</button>`
+           : `<button class="btn" style="margin-top:10px" onclick="closeDay('${d.date}')">Zaključi dan</button>`;
+    h += `</div>`;
+  });
+  return h;
+}
+async function closeDay(date) {
+  const d = daysSummary().find(x => x.date === date); if (!d) return;
+  const n = Object.values(d.toys).reduce((a, b) => a + b, 0);
+  if (!(await ask(`Zaključiti ${dayLabel(date)}? Promet ${eur(d.revenue)}, predano ${eur(d.handed)}. Sa zalihe se skida ${qty(n)} igračaka.`, 'Zaključi'))) return;
+  const [y, m, dd] = date.split('-');
+  const rec = { date, ts: Date.now(), dayTs: new Date(+y, +m - 1, +dd, 23, 59).getTime(), by: ME.display_name, handoverIds: d.hs.map(h => h.id),
+    revenue: r2(d.revenue), handed: r2(d.handed), diff: r2(d.diff), expenses: r2(d.expenses), toys: d.toys, toyNames: d.toyNames };
+  const { error } = await sb.from('day_closes').insert({ id: date, ts: rec.ts, data: rec });
+  if (error) return toast(/duplicate/i.test(error.message) ? 'Taj dan je već zaključen.' : errText(error));
+  S.closes.unshift(rec); toast('Dan zaključen ✓'); render(true);
+}
+async function reopenDay(date) {
+  if (!(await ask(`Ponovno otvoriti ${dayLabel(date)}? Igračke tog dana vraćaju se na zalihu dok ga opet ne zaključiš.`, 'Otvori'))) return;
+  const { error } = await sb.from('day_closes').delete().eq('id', date);
+  if (error) return toast(errText(error));
+  S.closes = S.closes.filter(c => c.date !== date); render(true);
 }
 
 /* ================= RADNICI (admin) ================= */
@@ -592,6 +682,7 @@ function render(force) {
   else if (tab === 'zaliha') { m.innerHTML = renderZaliha(); }
   else if (tab === 'artikli') { m.innerHTML = renderArtikli(); bindProdInputs(); }
   else if (tab === 'izvjestaj') { m.innerHTML = renderIzvjestaj(); }
+  else if (tab === 'zakljucak') { m.innerHTML = renderZakljucak(); }
   else if (tab === 'radnici') { m.innerHTML = renderRadnici(); bindRadnici(); }
 }
 boot();
