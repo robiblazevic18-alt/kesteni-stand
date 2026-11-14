@@ -45,7 +45,7 @@ const isAdmin = () => ME && ME.role === 'admin';
 
 /* ---------- stanje ---------- */
 let ME = null;
-const S = { config: { stock: [], products: [] }, purchases: [], handovers: [], closes: [], last: null, users: [] };
+const S = { config: { stock: [], products: [] }, purchases: [], handovers: [], closes: [], expenses: [], last: null, users: [] };
 let tab = 'smjena';
 let draft = null;
 let period = 'danas';
@@ -123,6 +123,7 @@ async function loadData() {
   if (isAdmin()) {
     jobs.push(sb.from('purchases').select('*').order('ts', { ascending: false }).limit(5000).then(({ data, error }) => { if (error) throw error; S.purchases = (data || []).map(p => ({ id: p.id, ts: +p.ts, stockId: p.stock_id, qty: +p.qty, unitCost: +p.unit_cost, note: p.note })); }));
     jobs.push(sb.from('handovers').select('data').order('ts', { ascending: false }).limit(3000).then(({ data, error }) => { if (error) throw error; S.handovers = (data || []).map(h => h.data); }));
+    jobs.push(sb.from('expenses').select('*').order('ts', { ascending: false }).limit(5000).then(({ data, error }) => { if (error) throw error; S.expenses = (data || []).map(e => ({ id: e.id, ts: +e.ts, category: e.category, amount: +e.amount, note: e.note })); }));
     jobs.push(sb.from('day_closes').select('data').order('id', { ascending: false }).limit(1000).then(({ data, error }) => { if (error) throw error; S.closes = (data || []).map(c => c.data); }));
   }
   await Promise.all(jobs);
@@ -136,7 +137,7 @@ async function startApp() {
 }
 async function refresh() { try { await loadData(); toast('Osvježeno'); } catch (e) { toast(errText(e)); } render(true); }
 
-const TABS_ADMIN = [['smjena', 'Primopredaja'], ['igracke', 'Igračke'], ['nabava', 'Nabava'], ['zaliha', 'Zaliha'], ['artikli', 'Artikli i cijene'], ['zakljucak', 'Zaključak dana'], ['izvjestaj', 'Izvještaj'], ['radnici', 'Radnici']];
+const TABS_ADMIN = [['smjena', 'Primopredaja'], ['pregled', 'Pregled'], ['troskovi', 'Troškovi'], ['igracke', 'Igračke'], ['nabava', 'Nabava'], ['zaliha', 'Zaliha'], ['artikli', 'Artikli i cijene'], ['zakljucak', 'Zaključak dana'], ['izvjestaj', 'Izvještaj'], ['radnici', 'Radnici']];
 function shell() {
   const tabs = isAdmin() ? TABS_ADMIN : [['smjena', 'Primopredaja']];
   $('#app').innerHTML = `<header><div class="top"><h1>🌰 Štand</h1><div class="who"><span>${esc(ME.display_name)}${isAdmin() ? ' · admin' : ''}</span><button onclick="refresh()">↻</button><button onclick="logout()">Odjava</button></div></div>
@@ -576,6 +577,118 @@ async function delHandover(id) {
   draft = null; saveDraftNull(); await refresh();
 }
 
+/* ================= TROŠKOVI I PREGLED (admin) ================= */
+const EXP_CATS = { kesteni: 'Roba – kesteni', kokice: 'Roba – kokice', kukuruz: 'Roba – kukuruz', ambalaza: 'Ambalaža', igracke: 'Igračke', najam: 'Najam prostora', place: 'Plaće radnika', ostalo: 'Ostali troškovi' };
+const EXP_COLORS = { kesteni: '#8a3b12', kokice: '#d9a441', kukuruz: '#e0c341', ambalaza: '#7a6656', igracke: '#c2577a', najam: '#3f6e8c', place: '#2f7a3d', ostalo: '#9b9b9b', kasa: '#b5541c' };
+function stockExpCat(stockId) {
+  const st = stockById(stockId); if (st && st.toy) return 'igracke';
+  const p = S.config.products.find(x => x.stockId === stockId);
+  return p && EXP_CATS[p.cat] ? p.cat : 'ostalo';
+}
+let pPeriod = 'mjesec', pFrom = '', pTo = '';
+function periodRange() {
+  const now = new Date(); let a, b = Infinity;
+  if (pPeriod === 'mjesec') a = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  else if (pPeriod === 'prosli') { a = new Date(now.getFullYear(), now.getMonth() - 1, 1).getTime(); b = new Date(now.getFullYear(), now.getMonth(), 1).getTime(); }
+  else if (pPeriod === 'godina') a = new Date(now.getFullYear(), 0, 1).getTime();
+  else if (pPeriod === 'raspon') { a = pFrom ? new Date(pFrom + 'T00:00:00').getTime() : 0; b = pTo ? new Date(pTo + 'T00:00:00').getTime() + 864e5 : Infinity; }
+  else a = 0;
+  return [a, b];
+}
+function periodButtons(fn) {
+  return `<div class="tabs2">${[['mjesec', 'Ovaj mjesec'], ['prosli', 'Prošli mjesec'], ['godina', 'Ova godina'], ['sve', 'Sve'], ['raspon', 'Od – do']].map(([k, v]) => `<button class="${pPeriod === k ? 'on' : ''}" onclick="pPeriod='${k}';render(true)">${v}</button>`).join('')}</div>
+   ${pPeriod === 'raspon' ? `<div class="row" style="margin-bottom:10px"><label>Od<input type="date" id="p_from" value="${pFrom}"></label><label>Do<input type="date" id="p_to" value="${pTo}"></label></div>` : ''}`;
+}
+function bindPeriod() {
+  const f = $('#p_from'), t = $('#p_to');
+  if (f) f.onchange = () => { pFrom = f.value; render(true); };
+  if (t) t.onchange = () => { pTo = t.value; render(true); };
+}
+function costLines(a, b) {
+  const rows = [];
+  S.expenses.filter(e => e.ts >= a && e.ts < b).forEach(e => rows.push({ ts: e.ts, cat: e.category, amount: e.amount, note: e.note, src: 'rucno', id: e.id }));
+  S.purchases.filter(p => p.qty > 0 && p.ts >= a && p.ts < b).forEach(p => { const st = stockById(p.stockId); rows.push({ ts: p.ts, cat: stockExpCat(p.stockId), amount: r2(p.qty * p.unitCost), note: `nabava: ${st ? st.name : '?'} ${qty(p.qty)} ${st ? st.unit : ''}`, src: 'nabava' }); });
+  S.handovers.filter(h => h.expenses > 0 && h.ts >= a && h.ts < b).forEach(h => rows.push({ ts: h.ts, cat: 'kasa', amount: h.expenses, note: `isplaćeno iz kase${h.expNote ? ': ' + h.expNote : ''} (${h.from})`, src: 'kasa' }));
+  return rows.sort((x, y) => y.ts - x.ts);
+}
+const catName = k => k === 'kasa' ? 'Isplaćeno iz kase (smjene)' : (EXP_CATS[k] || k);
+
+function renderTroskovi() {
+  const opts = Object.entries(EXP_CATS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('');
+  let h = `<div class="card"><h2>Upiši trošak</h2>
+   <div class="row"><label>Vrsta troška<select id="e_c">${opts}</select></label><label>Iznos €<input class="num" inputmode="decimal" id="e_a"></label></div>
+   <div class="row" style="margin-top:8px"><label>Datum<input type="date" id="e_d" value="${dayKey(Date.now())}"></label><label style="flex:2 1 200px">Opis<input id="e_n" placeholder="npr. najam za studeni, plaća Marko, čaše 500 kom…"></label></div>
+   <p class="muted" style="margin:8px 0">Nabave upisane u „Nabava” i „Igračke” te isplate iz kase u smjenama već se same ubrajaju u troškove – nemoj ih upisivati dvaput.</p>
+   <button class="btn" id="e_save">Spremi trošak</button></div>`;
+  h += `<div class="card"><h2>Troškovi</h2>${periodButtons()}`;
+  const [a, b] = periodRange(); const rows = costLines(a, b);
+  if (!rows.length) h += `<div class="empty">Nema troškova u ovom razdoblju.</div>`;
+  else {
+    h += `<table><tr><th>Datum</th><th>Vrsta</th><th class="r">Iznos</th><th></th></tr>`;
+    rows.slice(0, 300).forEach(r => h += `<tr><td>${dOnly(r.ts)}</td><td><span class="cat" style="background:${EXP_COLORS[r.cat]}22;color:${EXP_COLORS[r.cat]}">${esc(catName(r.cat))}</span>${r.note ? `<div class="muted">${esc(r.note)}</div>` : ''}${r.src !== 'rucno' ? `<div class="muted" style="font-size:12px">automatski (${r.src === 'nabava' ? 'iz nabave' : 'iz primopredaje'})</div>` : ''}</td><td class="r">${eur(r.amount)}</td><td class="r">${r.src === 'rucno' ? `<button class="btn bad small" onclick="delExpense('${r.id}')">✕</button>` : ''}</td></tr>`);
+    h += `<tr><td colspan="2"><b>Ukupno</b></td><td class="r"><b>${eur(rows.reduce((x, r) => x + r.amount, 0))}</b></td><td></td></tr></table>`;
+  }
+  return h + `</div>`;
+}
+function bindTroskovi() {
+  bindPeriod();
+  $('#e_save').onclick = async () => {
+    const amount = num($('#e_a').value); if (amount <= 0) return toast('Upiši iznos.');
+    const d = $('#e_d').value; const ts = d ? new Date(d + 'T12:00:00').getTime() : Date.now();
+    const rec = { id: uid(), ts, category: $('#e_c').value, amount: r2(amount), note: $('#e_n').value.trim() };
+    $('#e_save').disabled = true;
+    const { error } = await sb.from('expenses').insert(rec);
+    if (error) { $('#e_save').disabled = false; return toast('Nije spremljeno: ' + errText(error)); }
+    S.expenses.unshift(rec); S.expenses.sort((x, y) => y.ts - x.ts); toast('Trošak spremljen ✓'); render(true);
+  };
+}
+async function delExpense(id) {
+  if (!(await ask('Obrisati ovaj trošak?', 'Obriši'))) return;
+  const { error } = await sb.from('expenses').delete().eq('id', id);
+  if (error) return toast(errText(error));
+  S.expenses = S.expenses.filter(e => e.id !== id); render(true);
+}
+
+function renderPregled() {
+  const [a, b] = periodRange();
+  const H = S.handovers.filter(h => h.ts >= a && h.ts < b);
+  const revenue = r2(H.reduce((x, h) => x + h.revenue, 0));
+  const revByCat = {}; H.forEach(h => h.lines.forEach(l => { revByCat[l.cat] = (revByCat[l.cat] || 0) + l.rev; }));
+  const rows = costLines(a, b); const byCat = {}; rows.forEach(r => byCat[r.cat] = (byCat[r.cat] || 0) + r.amount);
+  const costs = r2(rows.reduce((x, r) => x + r.amount, 0)); const profit = r2(revenue - costs);
+  const diff = r2(H.reduce((x, h) => x + (h.diff || 0), 0));
+  const maxC = Math.max(1, ...Object.values(byCat));
+  let h = periodButtons();
+  h += `<div class="card"><div class="sum">
+     <span>Prihod (promet iz primopredaja)</span><span class="r"><b>${eur(revenue)}</b></span>
+     <span>Troškovi ukupno</span><span class="r">${eur(costs)}</span>
+     <span class="tot">Zarada (prihod − troškovi)</span><span class="r tot ${profit < 0 ? 'bad' : 'ok'}" style="font-size:20px">${eur(profit)}</span>
+     <span>Manjak / višak u kasi</span><span class="r ${diff < 0 ? 'bad' : diff > 0 ? 'warn' : ''}">${eur(diff)}</span></div>
+     <p class="muted" style="margin:8px 0 0">Nabava se računa kao trošak na dan kupnje, pa u kraćem razdoblju zarada može izgledati manja ili veća nego stvarno.</p></div>`;
+  h += `<div class="card"><h2>Troškovi po vrsti</h2>`;
+  const cats = Object.keys(byCat).sort((x, y) => byCat[y] - byCat[x]);
+  if (!cats.length) h += `<div class="empty">Nema troškova u ovom razdoblju.</div>`;
+  cats.forEach(k => h += `<div style="margin:8px 0"><div style="display:flex;justify-content:space-between;font-size:14px"><span>${esc(catName(k))}</span><span><b>${eur(byCat[k])}</b> <span class="muted">${costs ? Math.round(byCat[k] / costs * 100) : 0}%</span></span></div>
+      <div style="height:10px;background:#f1e6d8;border-radius:5px;margin-top:3px"><div style="height:10px;border-radius:5px;width:${(byCat[k] / maxC * 100).toFixed(1)}%;background:${EXP_COLORS[k] || '#999'}"></div></div></div>`);
+  h += `</div><div class="card"><h2>Prihod po vrsti</h2>`;
+  const rc = Object.keys(revByCat).sort((x, y) => revByCat[y] - revByCat[x]);
+  if (!rc.length) h += `<div class="empty">Nema prodaje u ovom razdoblju.</div>`;
+  else { h += `<table>`; rc.forEach(k => h += `<tr><td>${CATS[k] || k}</td><td class="r">${eur(revByCat[k])}</td></tr>`); h += `</table>`; }
+  h += `</div>`;
+  // po mjesecima
+  const months = {};
+  S.handovers.filter(x => x.ts >= a && x.ts < b).forEach(x => { const k = dayKey(x.ts).slice(0, 7); (months[k] = months[k] || { rev: 0, cost: 0 }).rev += x.revenue; });
+  rows.forEach(r => { const k = dayKey(r.ts).slice(0, 7); (months[k] = months[k] || { rev: 0, cost: 0 }).cost += r.amount; });
+  const mk = Object.keys(months).sort().reverse();
+  if (mk.length) {
+    h += `<div class="card"><h2>Po mjesecima</h2><table><tr><th>Mjesec</th><th class="r">Prihod</th><th class="r">Troškovi</th><th class="r">Zarada</th></tr>`;
+    mk.forEach(k => { const m = months[k]; const p = m.rev - m.cost; const [y, mo] = k.split('-');
+      h += `<tr><td>${new Date(+y, +mo - 1, 1).toLocaleDateString('hr-HR', { month: 'long', year: 'numeric' })}</td><td class="r">${eur(m.rev)}</td><td class="r">${eur(m.cost)}</td><td class="r ${p < 0 ? 'bad' : 'ok'}"><b>${eur(p)}</b></td></tr>`; });
+    h += `</table></div>`;
+  }
+  return h;
+}
+
 /* ================= ZAKLJUČAK DANA (admin) ================= */
 function daysSummary() {
   const days = {};
@@ -683,6 +796,8 @@ function render(force) {
   else if (tab === 'artikli') { m.innerHTML = renderArtikli(); bindProdInputs(); }
   else if (tab === 'izvjestaj') { m.innerHTML = renderIzvjestaj(); }
   else if (tab === 'zakljucak') { m.innerHTML = renderZakljucak(); }
+  else if (tab === 'troskovi') { m.innerHTML = renderTroskovi(); bindTroskovi(); }
+  else if (tab === 'pregled') { m.innerHTML = renderPregled(); bindPeriod(); }
   else if (tab === 'radnici') { m.innerHTML = renderRadnici(); bindRadnici(); }
 }
 boot();
