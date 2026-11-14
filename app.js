@@ -202,7 +202,7 @@ function saveConfig(msg = 'Spremljeno') {
 function newDraft() {
   const last = S.last; const prev = {}; if (last) (last.lines || []).forEach(l => prev[l.pid] = l.count);
   const lines = {}; activeProducts().forEach(p => lines[p.id] = { prev: prev[p.id] !== undefined ? dec(prev[p.id]) : '', add: '', count: '' });
-  return { baseId: last ? last.id : null, from: ME.display_name, to: '', lines, startCash: last ? dec(last.floatLeft) : '', expenses: '', expNote: '', floatLeft: '', counted: '', note: '', c1: false, c2: false };
+  return { baseId: last ? last.id : null, from: ME.display_name, to: '', lines, startCash: last ? dec(last.floatLeft) : '', floatLeft: '', counted: '', note: '', c1: false, c2: false };
 }
 function ensureDraft() {
   if (!draft || (draft.baseId || null) !== (S.last ? S.last.id : null)) draft = newDraft();
@@ -224,12 +224,12 @@ function calc() {
     lines.push({ pid: p.id, name: p.name, cat: p.cat, price: p.price, prev, add, count, sold, rev, stockId: p.stockId, use: p.use, filled });
   });
   revenue = r2(revenue);
-  const startCash = num(draft.startCash), expenses = num(draft.expenses), floatLeft = num(draft.floatLeft);
-  const expected = r2(startCash + revenue - expenses);
+  const startCash = num(draft.startCash), floatLeft = num(draft.floatLeft);
+  const expected = r2(startCash + revenue);
   const handover = r2(expected - floatLeft);
   const counted = draft.counted !== '' ? num(draft.counted) : null;
   const diff = counted === null ? null : r2(counted - expected);
-  return { lines, revenue, startCash, expenses, floatLeft, expected, handover, counted, diff, missing, negative };
+  return { lines, revenue, startCash, floatLeft, expected, handover, counted, diff, missing, negative };
 }
 function renderSmjena() {
   ensureDraft();
@@ -259,9 +259,8 @@ function renderSmjena() {
   h += `<div class="card"><h2>2. Novac</h2>
    <div class="row">
     <label>Početni novac u kasi${last ? ' (od prethodne smjene)' : ''}<input class="num" inputmode="decimal" id="f_start" value="${esc(draft.startCash)}" placeholder="0" ${last && !isAdmin() ? 'readonly style="background:#f4efe8"' : ''}></label>
-    <label>Isplaćeno iz kase tijekom smjene<input class="num" inputmode="decimal" id="f_exp" value="${esc(draft.expenses)}" placeholder="0"></label>
+
    </div>
-   <label style="margin-top:8px">Za što je isplaćeno<input id="f_expn" value="${esc(draft.expNote)}" placeholder="npr. plin, vrećice…"></label>
    <div class="row" style="margin-top:8px">
     <label>Ostavljam za iduću smjenu (promet/sitniš)<input class="num" inputmode="decimal" id="f_float" value="${esc(draft.floatLeft)}" placeholder="0"></label>
     <label>Izbrojano u kasi ukupno (provjera)<input class="num" inputmode="decimal" id="f_counted" value="${esc(draft.counted)}" placeholder="nije obavezno"></label>
@@ -279,7 +278,7 @@ function renderSmjena() {
 function bindSmjena() {
   const m = $('#main');
   m.querySelectorAll('input[data-l]').forEach(i => i.addEventListener('input', () => { draft.lines[i.dataset.l][i.dataset.f] = i.value; saveDraft(); updSmjena(); }));
-  const map = { f_from: 'from', f_to: 'to', f_start: 'startCash', f_exp: 'expenses', f_expn: 'expNote', f_float: 'floatLeft', f_counted: 'counted', f_note: 'note' };
+  const map = { f_from: 'from', f_to: 'to', f_start: 'startCash', f_float: 'floatLeft', f_counted: 'counted', f_note: 'note' };
   Object.entries(map).forEach(([id, k]) => { const el = $('#' + id); if (el) el.addEventListener('input', () => { draft[k] = el.value; saveDraft(); updSmjena(); }); });
   ['f_c1', 'f_c2'].forEach((id, ix) => { const el = $('#' + id); if (el) el.addEventListener('change', () => { draft[ix ? 'c2' : 'c1'] = el.checked; saveDraft(); updSmjena(); }); });
   const sb_ = $('#saveH'); if (sb_) sb_.onclick = saveHandover;
@@ -296,7 +295,6 @@ function updSmjena() {
   $('#moneyBox').innerHTML = `<div class="result"><div class="sum">
       <span>Početni novac</span><span class="r">${eur(c.startCash)}</span>
       <span>+ Promet od prodaje</span><span class="r">${eur(c.revenue)}</span>
-      <span>− Isplaćeno iz kase</span><span class="r">${eur(c.expenses)}</span>
       <span class="tot">= Mora biti u kasi</span><span class="r tot">${eur(c.expected)}</span>
       <span>− Ostaje za iduću smjenu</span><span class="r">${eur(c.floatLeft)}</span></div>
     <div style="margin-top:12px" class="lbl">ZA PREDAJU</div><div class="big">${eur(c.handover)}</div>
@@ -328,7 +326,7 @@ async function saveHandover() {
     const rec = {
       id: uid(), ts: Date.now(), baseId: draft.baseId || null, by: ME.display_name, from: draft.from.trim(), to: draft.to.trim(),
       lines: c.lines.map(l => ({ pid: l.pid, name: l.name, cat: l.cat, price: l.price, prev: l.prev, add: l.add, count: l.count, sold: l.sold, rev: l.rev, stockId: l.stockId, use: l.use })),
-      startCash: c.startCash, expenses: c.expenses, expNote: draft.expNote, floatLeft: c.floatLeft, counted: c.counted, revenue: c.revenue,
+      startCash: c.startCash, floatLeft: c.floatLeft, counted: c.counted, revenue: c.revenue,
       expected: c.expected, handover: c.handover, diff: c.diff, note: draft.note
     };
     const { error } = await sb.from('handovers').insert({ id: rec.id, ts: rec.ts, data: rec }); if (error) throw error;
@@ -532,7 +530,7 @@ function renderIzvjestaj() {
   const H = S.handovers.filter(h => inPeriod(h.ts)); const P = S.purchases.filter(p => inPeriod(p.ts) && p.qty > 0);
   let rev = 0, handed = 0, cogs = 0, exp = 0, diff = 0; const per = {};
   H.forEach(h => {
-    rev += h.revenue; handed += h.handover; exp += h.expenses || 0; diff += h.diff || 0;
+    rev += h.revenue; handed += h.handover; diff += h.diff || 0;
     h.lines.forEach(l => { cogs += l.sold * (l.use || 0) * (st[l.stockId]?.avg || 0); const k = l.name; per[k] = per[k] || { sold: 0, rev: 0, cat: l.cat }; per[k].sold += l.sold; per[k].rev += l.rev; });
   });
   const buy = P.reduce((a, p) => a + p.qty * p.unitCost, 0);
@@ -541,7 +539,6 @@ function renderIzvjestaj() {
    <span>Broj primopredaja</span><span class="r">${H.length}</span>
    <span>Promet (prodaja)</span><span class="r"><b>${eur(rev)}</b></span>
    <span>Predano novca</span><span class="r">${eur(handed)}</span>
-   <span>Isplaćeno iz kase</span><span class="r">${eur(exp)}</span>
    <span>Manjak / višak u kasi</span><span class="r ${diff < 0 ? 'bad' : diff > 0 ? 'warn' : ''}">${eur(diff)}</span>
    <span>Nabavna vrijednost prodanog (procjena)</span><span class="r">${eur(cogs)}</span>
    <span class="tot">Bruto zarada (procjena)</span><span class="r tot ${rev - cogs < 0 ? 'bad' : 'ok'}">${eur(rev - cogs)}</span>
@@ -562,7 +559,7 @@ function renderIzvjestaj() {
     <table style="margin-top:6px"><tr><th>Artikl</th><th class="r">Preth.</th><th class="r">Dop.</th><th class="r">Sada</th><th class="r">Prod.</th><th class="r">Promet</th></tr>
     ${x.lines.map(l => `<tr><td>${esc(l.name)}</td><td class="r">${qty(l.prev)}</td><td class="r">${qty(l.add)}</td><td class="r">${qty(l.count)}</td><td class="r">${qty(l.sold)}</td><td class="r">${eur(l.rev)}</td></tr>`).join('')}</table>
     <div class="sum" style="margin-top:6px"><span>Početni novac</span><span class="r">${eur(x.startCash)}</span><span>Promet</span><span class="r">${eur(x.revenue)}</span>
-    <span>Isplaćeno${x.expNote ? ' (' + esc(x.expNote) + ')' : ''}</span><span class="r">${eur(x.expenses)}</span><span>Moralo biti u kasi</span><span class="r">${eur(x.expected)}</span>
+    <span>Moralo biti u kasi</span><span class="r">${eur(x.expected)}</span>
     ${x.counted !== null && x.counted !== undefined ? `<span>Izbrojano u kasi</span><span class="r">${eur(x.counted)}</span>` : ''}
     <span>Ostavljeno za iduću smjenu</span><span class="r">${eur(x.floatLeft)}</span><span class="tot">Za predaju</span><span class="r tot">${eur(x.handover)}</span></div>
     <p class="muted">Upisao/la: ${esc(x.by || '')}${x.note ? ' · Napomena: ' + esc(x.note) : ''}</p>
@@ -579,7 +576,7 @@ async function delHandover(id) {
 
 /* ================= TROŠKOVI I PREGLED (admin) ================= */
 const EXP_CATS = { kesteni: 'Roba – kesteni', kokice: 'Roba – kokice', kukuruz: 'Roba – kukuruz', ambalaza: 'Ambalaža', igracke: 'Igračke', najam: 'Najam prostora', place: 'Plaće radnika', ostalo: 'Ostali troškovi' };
-const EXP_COLORS = { kesteni: '#8a3b12', kokice: '#d9a441', kukuruz: '#e0c341', ambalaza: '#7a6656', igracke: '#c2577a', najam: '#3f6e8c', place: '#2f7a3d', ostalo: '#9b9b9b', kasa: '#b5541c' };
+const EXP_COLORS = { kesteni: '#8a3b12', kokice: '#d9a441', kukuruz: '#e0c341', ambalaza: '#7a6656', igracke: '#c2577a', najam: '#3f6e8c', place: '#2f7a3d', ostalo: '#9b9b9b' };
 function stockExpCat(stockId) {
   const st = stockById(stockId); if (st && st.toy) return 'igracke';
   const p = S.config.products.find(x => x.stockId === stockId);
@@ -608,24 +605,23 @@ function costLines(a, b) {
   const rows = [];
   S.expenses.filter(e => e.ts >= a && e.ts < b).forEach(e => rows.push({ ts: e.ts, cat: e.category, amount: e.amount, note: e.note, src: 'rucno', id: e.id }));
   S.purchases.filter(p => p.qty > 0 && p.ts >= a && p.ts < b).forEach(p => { const st = stockById(p.stockId); rows.push({ ts: p.ts, cat: stockExpCat(p.stockId), amount: r2(p.qty * p.unitCost), note: `nabava: ${st ? st.name : '?'} ${qty(p.qty)} ${st ? st.unit : ''}`, src: 'nabava' }); });
-  S.handovers.filter(h => h.expenses > 0 && h.ts >= a && h.ts < b).forEach(h => rows.push({ ts: h.ts, cat: 'kasa', amount: h.expenses, note: `isplaćeno iz kase${h.expNote ? ': ' + h.expNote : ''} (${h.from})`, src: 'kasa' }));
   return rows.sort((x, y) => y.ts - x.ts);
 }
-const catName = k => k === 'kasa' ? 'Isplaćeno iz kase (smjene)' : (EXP_CATS[k] || k);
+const catName = k => EXP_CATS[k] || k;
 
 function renderTroskovi() {
   const opts = Object.entries(EXP_CATS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('');
   let h = `<div class="card"><h2>Upiši trošak</h2>
    <div class="row"><label>Vrsta troška<select id="e_c">${opts}</select></label><label>Iznos €<input class="num" inputmode="decimal" id="e_a"></label></div>
    <div class="row" style="margin-top:8px"><label>Datum<input type="date" id="e_d" value="${dayKey(Date.now())}"></label><label style="flex:2 1 200px">Opis<input id="e_n" placeholder="npr. najam za studeni, plaća Marko, čaše 500 kom…"></label></div>
-   <p class="muted" style="margin:8px 0">Nabave upisane u „Nabava” i „Igračke” te isplate iz kase u smjenama već se same ubrajaju u troškove – nemoj ih upisivati dvaput.</p>
+   <p class="muted" style="margin:8px 0">Nabave upisane u „Nabava” i „Igračke” već se same ubrajaju u troškove – nemoj ih upisivati dvaput.</p>
    <button class="btn" id="e_save">Spremi trošak</button></div>`;
   h += `<div class="card"><h2>Troškovi</h2>${periodButtons()}`;
   const [a, b] = periodRange(); const rows = costLines(a, b);
   if (!rows.length) h += `<div class="empty">Nema troškova u ovom razdoblju.</div>`;
   else {
     h += `<table><tr><th>Datum</th><th>Vrsta</th><th class="r">Iznos</th><th></th></tr>`;
-    rows.slice(0, 300).forEach(r => h += `<tr><td>${dOnly(r.ts)}</td><td><span class="cat" style="background:${EXP_COLORS[r.cat]}22;color:${EXP_COLORS[r.cat]}">${esc(catName(r.cat))}</span>${r.note ? `<div class="muted">${esc(r.note)}</div>` : ''}${r.src !== 'rucno' ? `<div class="muted" style="font-size:12px">automatski (${r.src === 'nabava' ? 'iz nabave' : 'iz primopredaje'})</div>` : ''}</td><td class="r">${eur(r.amount)}</td><td class="r">${r.src === 'rucno' ? `<button class="btn bad small" onclick="delExpense('${r.id}')">✕</button>` : ''}</td></tr>`);
+    rows.slice(0, 300).forEach(r => h += `<tr><td>${dOnly(r.ts)}</td><td><span class="cat" style="background:${EXP_COLORS[r.cat]}22;color:${EXP_COLORS[r.cat]}">${esc(catName(r.cat))}</span>${r.note ? `<div class="muted">${esc(r.note)}</div>` : ''}${r.src !== 'rucno' ? `<div class="muted" style="font-size:12px">automatski (iz nabave)</div>` : ''}</td><td class="r">${eur(r.amount)}</td><td class="r">${r.src === 'rucno' ? `<button class="btn bad small" onclick="delExpense('${r.id}')">✕</button>` : ''}</td></tr>`);
     h += `<tr><td colspan="2"><b>Ukupno</b></td><td class="r"><b>${eur(rows.reduce((x, r) => x + r.amount, 0))}</b></td><td></td></tr></table>`;
   }
   return h + `</div>`;
@@ -693,8 +689,8 @@ function renderPregled() {
 function daysSummary() {
   const days = {};
   S.handovers.forEach(h => {
-    const k = dayKey(h.ts); const d = days[k] = days[k] || { date: k, hs: [], revenue: 0, handed: 0, diff: 0, expenses: 0, toys: {}, toyNames: {} };
-    d.hs.push(h); d.revenue += h.revenue; d.handed += h.handover; d.diff += h.diff || 0; d.expenses += h.expenses || 0;
+    const k = dayKey(h.ts); const d = days[k] = days[k] || { date: k, hs: [], revenue: 0, handed: 0, diff: 0, toys: {}, toyNames: {} };
+    d.hs.push(h); d.revenue += h.revenue; d.handed += h.handover; d.diff += h.diff || 0;
     (h.lines || []).forEach(l => { if (isToyStock(l.stockId) && l.sold) { d.toys[l.stockId] = (d.toys[l.stockId] || 0) + l.sold; d.toyNames[l.stockId] = l.name; } });
   });
   return Object.values(days).sort((a, b) => b.date.localeCompare(a.date));
@@ -712,7 +708,6 @@ function renderZakljucak() {
       ${c ? `<span class="pill ok">zaključeno ✓</span>` : `<span class="pill warn">otvoreno</span>`}</div>
       <div class="sum" style="margin-top:8px"><span>Primopredaja</span><span class="r">${d.hs.length}</span>
       <span>Promet</span><span class="r"><b>${eur(d.revenue)}</b></span><span>Predano</span><span class="r">${eur(d.handed)}</span>
-      <span>Isplaćeno iz kase</span><span class="r">${eur(d.expenses)}</span>
       <span>Manjak / višak</span><span class="r ${d.diff < 0 ? 'bad' : d.diff > 0 ? 'warn' : ''}">${eur(d.diff)}</span></div>`;
     h += `<h3>Igračke ${c ? 'skinute' : 'za skidanje'} sa zalihe</h3>`;
     if (!toys.length) h += `<div class="muted">Taj dan nije prodana nijedna igračka.</div>`;
@@ -734,7 +729,7 @@ async function closeDay(date) {
   if (!(await ask(`Zaključiti ${dayLabel(date)}? Promet ${eur(d.revenue)}, predano ${eur(d.handed)}. Sa zalihe se skida ${qty(n)} igračaka.`, 'Zaključi'))) return;
   const [y, m, dd] = date.split('-');
   const rec = { date, ts: Date.now(), dayTs: new Date(+y, +m - 1, +dd, 23, 59).getTime(), by: ME.display_name, handoverIds: d.hs.map(h => h.id),
-    revenue: r2(d.revenue), handed: r2(d.handed), diff: r2(d.diff), expenses: r2(d.expenses), toys: d.toys, toyNames: d.toyNames };
+    revenue: r2(d.revenue), handed: r2(d.handed), diff: r2(d.diff), toys: d.toys, toyNames: d.toyNames };
   const { error } = await sb.from('day_closes').insert({ id: date, ts: rec.ts, data: rec });
   if (error) return toast(/duplicate/i.test(error.message) ? 'Taj dan je već zaključen.' : errText(error));
   S.closes.unshift(rec); toast('Dan zaključen ✓'); render(true);

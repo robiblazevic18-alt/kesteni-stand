@@ -1,5 +1,5 @@
 // Service worker: aplikacija se otvara i bez interneta; podaci idu uvijek preko mreže.
-const VERSION = 'stand-v3';
+const VERSION = 'stand-v4';
 const SHELL = ['./', './index.html', './app.js', './supabase.js', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
